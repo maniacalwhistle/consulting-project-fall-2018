@@ -1,0 +1,600 @@
+---
+title: "Statistical Consulting Project"
+author: "Michael Sampson"
+date: "12/6/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='Figs/',
+                      echo=FALSE, warning=FALSE, message=FALSE, comment=">R")
+```
+
+```{r load_packages, include=FALSE}
+library(data.table)
+library(simstudy)
+library(ggplot2)
+
+library(broom)
+library(lme4)
+library(lmerTest)
+
+library(tictoc)
+library(parallel)
+```
+
+```{r setup_parameters}
+# outcome mean and sd
+meanOutcome <- 364
+sdOutcome <- 97
+
+# how many sites are we including in the study?
+n_sites <- 10
+```
+
+# Power Analysis of Simulated Treatment Effect of Exercise on Swallowing Performance using *simstudy*
+
+> As we age, we lose muscles mass and function in the throat. This can cause difficulty swallowing, pneumonia (when material is misdirected into the lungs during swallowing), and can harm nutrition, hydration, and quality of life. Can we prevent and or reverse this phenomenon?” (Molfenter and Wolfe)
+
+### Study Background
+
+#### A Proposed Model ( Molfenter and Wolfe)
+How is swallowing performance related to pharyngeal muscle loss and secondary health measures?  Molfenter and Wolfe hypothesize that increasing levels of pharyngeal muscle loss lead to worse swallowing performance among healthy aging adults. Muscle loss in the pharnyx is a function of aging, poorer protein intake, higher protein requirements and increased activity.
+
+![study design diagram](Figs/Reversing_muscle_loss_DAG.png)
+
+The primary research question driving this project is,
+
+* __Can we exercise the muscles in the throat to strengthen them for improved swallowing function?__
+
+The goal of this project is to generate and test a set of candidate study designs that will be used to estimate the treatment effect of exercise on phrayngeal muscle loss. We'll use simulation to conduct a power analysis over a range of possible treatment effects, intra-class correlations, and sample sizes to determine the final sample size for a sufficiently powered study. We plan to use the _simstudy_ package in R to generate simulated data for each candidate study design. Once the data has been simulated, we'll fit mixed effects models to estimate the treatement effect, running the simulation many times to estimate power.
+
+#### Study population
+Randomization will occur at the person level within sites. Sites are places such as senior centers, naturally occurring retirement communities (NORCs) and community centers. In this simulation, we will assume recruitment will occurs across `r n_sites` and that randomization will be _balanced_ within sites. 
+
+##### Sample size
+We plan to vary the total sample size by varying the number of recruited persons within each site, ranging from 15 to 30 by 3. The unit of inference is the individual. Results from this study will be used to make generalizations to the target population aging adults.
+
+#### Interventions
+There are two interventions that will be included in the study:
+
+* `Exercise`: consists of 4 swallowing exercises 3 times weeks for 8 weeks 
+* `Exercise + Protein`: combined exercise regimen and supplemental protein for 8 weeks
+
+As is standard in a randomized control trial there will be a group of participants who will be assigned to the `Control` group. Participants in the `Control` group will not receive an active intervention but will participate in the study in a yet to be determined fashion to that is as similiar to the internvention groups except for actually receiving the treatment.
+
+The study design looks like this:
+![study design diagram](Figs/study_diagram_rct.png)
+
+#### Outcomes
+In this simulation, the primary outcome is `peak pressure`, a measure of swallowing performance in adults.
+According to the researchers and the supporting literature in the field, a typical mean value for `peak pressure` in healthy, older adults is `r meanOutcome` (mmHg/s/cm), with a standard deviation of `r sdOutcome` (mmHg/s/cm). We'll use these values throughout our simulation.
+
+There are a battery of throat-related secondary outcome measures that this simulation will not address but that may be included in future analyses. These secondary outcome include measures of pharyngeal shortening, pharyngeal constriction, pre-albumin levels, etc.
+
+##### Effect Size
+Currently there is no available estimate of the effect size of exercise on `peak pressure`. We therefore plan to simulate __low__ (0.1), __medium__ (0.5), and __high__ (0.9) effect sizes when estimating power. The variation in the outcome measure is very high (sd = `r sdOutcome`) which initially suggests that the effect size will need to be relatively large to be detected.
+
+##### Intra-class correlation (ICC)
+There is reason to believe that individuals recruited from the same site may have correlated outcomes, given the nature of the recruitment sites (e.g. naturally occuring senior centers). To address this concern, we will simulate different levels of the correlation among individuals at any given site by varying the intra-class corrleation (ICC) across simulations. We plan to simulate __low__ (0.1), __medium__ (0.5), and __high__ (0.9) values of ICC.
+
+To review, we plan to simulate a set of candidate designs to estimate the effect of exercise and exercise plus protein on swallowing performance in healthy aging adults. In our first simulation we will be generating data for a standard Randomized Control Trial (RCT) with two treatment arms. We'll fit a mixed effect model to estimate the effect and estimate the power by simulating the study repeatedly a large number of times. Finally, we plan to vary __sample size__, __effect size__, and __ICC__ to understand how these parameters affect overall power.
+
+
+### Simulating a single study data with _simstudy_
+We'll start by simulating data for one run of the study. We will then conduct a power analysis using the data definitions created for this single run. Finally, we'll run the study many times, varying the paramters outlined above.
+
+Initially, we'll set our variance within and between sites using the variance estimates provided by the researches. We'll also set the ICC to 0.5.
+```{r ICC, echo=TRUE}
+varWithin <- sdOutcome^2
+varBetween <- iccRE(ICC = 0.5, varWithin = varWithin , dist = 'normal')
+varTotal <- varWithin + varBetween
+
+cat(paste0("total variance = ",varTotal),"\n",
+    paste0("between variance = ",varBetween),"\n",
+    paste0("within variance = ",varWithin))
+```
+
+Next we'll define the data generating processes. We start by defining __site-level data__ ("site"). The site level definitions include:
+
+* random variation at the site level; (mean = 0, variance = between site variance)
+* number of people per site
+
+```{r site_def, echo=TRUE}
+# how many participants per site?
+n_per_site <- 15
+
+# add variance of the outcome measure that is attributable to the cluster
+siteDef <- defData(varname = "site_RE", formula = 0, variance = varBetween, dist = "normal", id = "site_id")
+siteDef <- defData(siteDef, varname = "n_per_site", formula = n_per_site, dist = "nonrandom")
+
+# head(siteDef)
+```
+
+Next we generate site level data using our site-level definitions. The code below will generate `r n_sites` with `r n_per_site` people per site and a site-level variation of `r varBetween`.
+```{r site_gen, echo=TRUE}
+# set a seed for reporducibility
+set.seed(10031)
+
+# create N sites with characteristics defined above and take a peek
+dt.sites <- genData(n_sites, siteDef)
+head(dt.sites)
+```
+
+Now we add individuals to each site. This should be a dataset that contains `r n_sites * n_per_site` records.
+
+```{r person_gen, echo=TRUE}
+# Add individuals to clusters
+dt.person <- genCluster(dt.sites, cLevelVar = "site_id", numIndsVar = "n_per_site", level1ID = "person_id")
+head(dt.person)
+
+# check number of records
+nrow(dt.person)
+```
+
+Because we are randomizing the treatment arms within sites, we now need to assign each person to a treatment group that is balanced __within__ each site. This means that each site should have `r n_per_site/3` people assigned to each treatment.
+
+```{r treat_assgin, echo=TRUE}
+# Assign intervention randomly to each person, balanced within each site
+dt.person <- trtAssign(dt.person, nTrt = 3, grpName = "treatment",  balanced = T, strata = "site_id")
+head(dt.person)
+```
+
+Examine balance across treatment groups: Are there an equal number of sites assigned to each treatment?
+```{r balance_sites}
+dt.person[, .(sites = uniqueN(site_id)), keyby = treatment]
+```
+
+Examine balance of treatment arms within sites: Are there an equal number of people assigned to each treatment within each site? Check by looking at a random sample of sites.
+```{r balance_within_sites}
+dt.person[site_id %in% sample(1:n_sites, 4), .N, keyby = .(site_id, treatment)]
+```
+
+Now we generate outcomes for each person prior to receiving their assigned treatment (`Y_pre`) and after (`Y_post`). The treatment takes on values 1 (control), 2 (exercise), and 3 (exercise+protein). For this initial set up we are going to assume that __exercise has an effect of 20 (mmHg/s/cm)__ and __exercise+ has an effect of 24 (mmHg/s/cm)__. The equation for each individual at baseline is $$\alpha + site_{ran.err}$$ while the equation after randomization is $$\alpha + site_{ran.err} + 20 * (exercise) + 24 * (exercise+)$$
+
+```{r treat_def, echo=TRUE}
+trtDef <- defDataAdd(varname = "Y_pre",
+                     dist = "normal",
+                     formula = paste(meanOutcome, "+ site_RE"),
+                     variance = varWithin)
+
+trtDef <- defDataAdd(trtDef,
+                     varname = "Y_post",
+                     dist = "normal",
+                     formula = paste(meanOutcome," + site_RE  + 20 * (treatment == 2) + 24 * (treatment == 3)"),
+                     variance = varWithin)
+
+# head(trtDef)
+```
+
+With our treatment definitions in place, we generate pre- and post-treatment outcome values for each individual in our dataset.
+```{r treat_gen, echo=TRUE}
+# Generate outcome measures for each person pre treatment and post treatment
+dt.person <- addColumns(trtDef, dt.person)
+round(head(dt.person))
+```
+
+For each site, calculate mean of outcome at both time points across all three treatment conditions and compute the pre and post difference for all three treatment groups.  Remember -- the true treatment effects are:
+
+* control = 0
+* exercise = 20
+* exercise+ = 24
+
+Here we view a sample of sites within each treatement group.
+```{r treat_as_fact, include=FALSE}
+# recode treatment variable as a factor
+dt.person[, treatment := factor(treatment, levels = c(1,2,3), labels = c("control","exercise","exercise+"))]
+```
+
+```{r view_pre_post_means}
+# pre, post, and post-pre difference by site and treatment
+dt.person[, lapply(.SD, mean), .SDcols = Y_pre:Y_post, keyby = .(treatment, site_id)][, .(Y_pre = round(Y_pre), Y_post = round(Y_post), `Y_post - Y_pre` =  round(Y_post - Y_pre)), keyby = .(treatment, site_id)][, head(.SD, 2), keyby = .(treatment)]
+
+# pre, post, and post-pre difference by treatment only
+dt.person[, lapply(.SD, mean), .SDcols = Y_pre:Y_post, keyby = .(treatment)][, .(Y_pre = round(Y_pre), Y_post = round(Y_post), `Y_post - Y_pre` =  round(Y_post - Y_pre)), keyby = treatment]
+```
+Now we will plot mean value of `peak pressure` for each treatment condition along with individual outcomes. (This plot is a replication of that found on rdatagen.com). We'll start by creating a temporary dataset that contains the treatment group means we just computed.
+
+```{r data_for_plot}
+tmp <- melt(dt.person, measure.vars = c("Y_pre","Y_post"), variable.name = "period", value.name = "Y")
+tmp[, period := tstrsplit(period, "_", keep = 2)]
+tmp[, period := factor(period, levels = c("pre","post"))]
+tmp <- tmp[, .(Y = mean(Y)), keyby = .(site_id, period, treatment)]
+```
+
+```{r plot_outcomes}
+ggplot(data = tmp[, mean(Y), by = .(treatment, period)], aes(y=V1, x = period)) +
+  geom_jitter(data = tmp, aes(y=Y, x = period, color = treatment), 
+              width = .05, height = 0, size = 2, alpha = 0.60) +
+  geom_line(aes(group = treatment, color = treatment)) +
+  geom_point(aes(group = treatment, color = treatment), size = 4.5) +
+  scale_color_manual(values = c("#35264b", "#00795f", "#f52c00")) +
+  labs(y = "peak pressure (Y)",
+       x = "assessment period",
+       title = "Average peak pressure by treatment group and period of assessment",
+       subtitle = "ICC = 0.5, number of sites = 10, person per site = 15") + 
+  theme(text = element_text(size=15), legend.position = "top" )
+```
+
+
+We'll calculate the treatment effect using regression. We'll start with a simple linear model that does not take into account cluster level variation. The first model ignores the first assesstment (pre), the second includes pre- scores as a term in the linear model. We'll estimate the model with with $Y_{post}$ as our outcome and the change score as our outcome ($Y_{post} - Y_{pre}$)
+
+```{r add_change_score}
+dt.person[, Y_diff := (Y_post - Y_pre)]
+```
+
+
+```{r lin_model, echo=TRUE}
+# run a simple linear model, ignoring pre-scores
+tidy(lm(Y_post ~ treatment, data = dt.person))[c("term","estimate","p.value")]
+
+# run a simple linear model of the change from 
+tidy(lm(Y_diff ~ treatment, data = dt.person))[c("term","estimate","p.value")]
+```
+
+Now run a mixed effects model to account for site-level variation. Remember:
+
+* site-level variance = `r varBetween`
+* person-level variance = `r varWithin`
+
+```{r mix_model, echo=TRUE}
+# run a mixed effects model, ignoring pre-scores
+coef(summary((lmerTest::lmer(Y_post ~ treatment + (1|site_id), data = dt.person))))
+
+# run a mixed effects model, including pre-scores
+coef(summary(lmerTest::lmer(Y_diff ~ treatment + (1|site_id), data = dt.person)))
+```
+
+## Power Analysis
+
+### Estimating power by varying sample sizes, effect sizes and ICCs
+
+Calculate power analysis for different sample sizes (150 to 300 by ), effect sizes (0.1, 0.5, 0.9), and ICCs (0.1, 0.5, 0.9). Start by creating function to run power for N iterations with given arguments.
+
+```{r power_analysis_single, echo=TRUE}
+iters <- 100
+p.results <- data.table()
+
+print("...running power analysis...")
+tic("single power analysis")
+for (i in 1:iters) {
+  
+  dt.sites <- genData(n_sites, siteDef)
+  
+  dt.person <- genCluster(dt.sites, cLevelVar = "site_id", numIndsVar = "n_per_site", level1ID = "person_id")
+  
+  dt.person <- trtAssign(dt.person, nTrt = 3, grpName = "treatment",  balanced = T, strata = "site_id")
+  
+  dt.person <- addColumns(trtDef, dt.person)
+  
+  dt.person[, treatment := factor(treatment, levels = c(1,2,3), labels = c("control","exercise","exercise+"))]
+  
+  dt.person[, Y_diff := (Y_post - Y_pre)]
+  
+  # store model fit
+  mod.fit <- lmerTest::lmer(Y_diff ~ treatment + (1|site_id), data = dt.person)
+  
+  # extract p-values for each intervention
+  p.exercise <- coef(summary(mod.fit))["treatmentexercise","Pr(>|t|)"]
+  p.exercise_protein <- coef(summary(mod.fit))["treatmentexercise+","Pr(>|t|)"]
+  
+  # store p-values into a data.table
+  p.results <- rbind(p.results, data.table(p.exercise, p.exercise_protein))
+}
+toc()
+
+# glance at results different iterations
+head(p.results)
+```
+
+Now find the proportion of iterations where the p-value for each treatment is less that a specificed alpha value.
+```{r power_results}
+alpha = 0.05
+p.results[, lapply(.SD, function(x) {mean(x < alpha)})]
+```
+
+Generate function to run power for a specified number of iterations
+```{r power_func_rct, echo=TRUE}
+get_power_rct <- function(n_per_site, eff_size, icc, protein_eff = 0.05, iters = 100, n_sites = 10, block = T, alpha = 0.05) {
+  
+  # compute the absolute effect based on the effect size passed into function
+  # for both treatment arms
+  eff_exercise <- round(eff_size*sdOutcome)
+  eff_exercise_protein <- round((eff_size+protein_eff)*sdOutcome)
+  
+  # create a text based formula to be based to simstudy functions a mean value
+  # for treatment arms
+  f.pre <- "site_RE"
+  f.post <- paste("site_RE +", eff_exercise, "* (treatment == 2) +", eff_exercise_protein, "* (treatment == 3)")
+  
+  # initialize a data table to store different variables
+  power.results <- data.table(ss = n_per_site * n_sites, 
+                              eff_size = eff_size,
+                              icc = icc)
+  
+  p.results <- data.table()
+  
+  for (i in 1:iters) {
+    varWithin <- sdOutcome^2
+    varBetween <- iccRE(ICC = icc, varWithin = varWithin , dist = 'normal')
+    # varTotal <- varWithin + varBetween
+    
+    # add variance of the outcome measure that is attributable to the cluster
+    siteDef <- defData(varname = "site_RE", formula = meanOutcome, variance = varBetween, dist = "normal", id = "site_id")
+    siteDef <- defData(siteDef, varname = "n_per_site", formula = n_per_site, dist = "nonrandom")
+    
+    # Generate site data
+    dt.sites <- genData(n_sites, siteDef)
+    
+    # Add individuals to each site
+    dt.person <- genCluster(dt.sites, cLevelVar = "site_id", numIndsVar = "n_per_site", level1ID = "person_id")
+    
+    # Randomly assign intervention at person level
+    if(block == T){
+      dt.person <- trtAssign(dt.person, nTrt = 3, grpName = "treatment", balanced = TRUE, strata = "site_id")  
+    } else {
+      dt.person <- trtAssign(dt.person, nTrt = 3, grpName = "treatment", balanced = TRUE)  
+    }
+    
+    # Generate outcome measures for each person pre- and post- treatment
+    # control (treatmment == 1), exercise (treatment == 2), exercise+ (treatment == 3)
+    trtDef <- defDataAdd(varname = "Y_pre",
+                         dist = "normal",
+                         formula = f.pre,
+                         variance = varWithin)
+    
+    trtDef <- defDataAdd(trtDef,
+                         varname = "Y_post",
+                         dist = "normal",
+                         formula = f.post,
+                         variance = varWithin)
+    
+    # Generate outcome measures for each person pre treatment and post treatment
+    dt.person <- addColumns(trtDef, dt.person)
+    dt.person[, treatment := factor(treatment, levels = c(1,2,3), labels = c("control","exercise","exercise+"))]
+    
+    # Compute change score
+    dt.person[, Y_diff := (Y_post - Y_pre)]
+    
+    # store model fit
+    mod.fit <- lmerTest::lmer(Y_diff ~ treatment + (1|site_id), data = dt.person)
+    
+    # extract p-values for each intervention
+    p.exercise <- coef(summary(mod.fit))["treatmentexercise","Pr(>|t|)"]
+    p.exercise_protein <- coef(summary(mod.fit))["treatmentexercise+","Pr(>|t|)"]
+    
+    # store p-values into a data.table
+    p.results <- rbind(p.results, data.table(p.exercise, p.exercise_protein))
+  }
+  power.results <- cbind(power.results, p.results[, lapply(.SD, function(x) {mean(x < alpha)})])
+  return(power.results)
+}
+```
+
+Determine parameters to go into function. First determine vector of __sample sizes__
+```{r n_vec, echo=TRUE}
+n.vec <- seq(15, 30, 1)[seq(15, 30, 1) %% 3 == 0]
+print(n.vec)
+```
+
+Next determine vector of __effect sizes__
+```{r eff_vec, echo=TRUE}
+eff.vec <- seq(0.1, 0.9, by = 0.1)
+print(eff.vec)
+```
+Next determine vector of __ICCs__
+```{r icc_vec, echo=TRUE}
+icc.vec <- seq(0.1, 0.9, by = 0.1)
+print(icc.vec)
+```
+
+Now generate a datatable with the different combinations of parameter values of sample size and treatment effects
+```{r vary_params} 
+# Create data.table with all possible combinations of parameters
+param.cols <- CJ(n_per_site = n.vec, 
+                 eff_sizes = eff.vec, 
+                 icc = icc.vec, 
+                 sorted = T)
+
+# param.cols <- data.table(n_per_site = n.vec, 
+#                          eff_sizes = rep(eff.vec, each = length(n.vec)),
+#                          icc = rep(icc.vec, each = length(n.vec) * length(eff.vec)))
+                         
+# how many different combinations are there for simulation?
+head(param.cols)
+tail(param.cols)
+nrow(param.cols)
+```
+
+Now run power analysis for randomized control trial for different sample sizes, effect sizes, and ICCs. Keep track of time using _tictoc_ package.
+```{r power_by_params_rct, echo=TRUE, include=FALSE}
+# iters <- 100
+# # allocate all logical cores of machine except one to do the job
+# # using parallel package to running mapply with parallezation
+# n.cores <- detectCores() - 1
+# 
+# print("...Running power analysis for study design with different sample sizes, effect sizes, and ICCs...")
+# tic(msg = "run power analysis",log = T)
+# power_run <- mcmapply(get_power_rct, 
+#                       n_per_site = param.cols$n_per_site, 
+#                       eff_size = param.cols$eff_size, 
+#                       param.cols$icc, 
+#                       iters = iters, 
+#                       n_sites = n_sites, 
+#                       block = T, 
+#                       mc.cores = n.cores)
+# toc()
+```
+
+Now convert results from power analyis into a data table
+```{r shape_power_results, include=FALSE}
+# tic(msg = "convert to data.table", log = T)
+# print("...Finished power analysis. Now reshaping and converting to data.table...")
+# dt.power <- data.table(t(power_run))
+# dt.power[, names(dt.power) := lapply(.SD, as.numeric)]
+# setkey(dt.power, ss, eff_size)
+# print("...Finished cleaning and reshaping results.")
+# toc()
+```
+
+```{r write_data}
+# fwrite(dt.power, "simdata.csv")
+```
+Plot results of power analysis. We'll plot the power of each study (Y) against the sample size (x) for different levels of the effect size and ICC
+
+### Results: Randomized Control Trial
+```{r plot_rct_power}
+dt.power <- fread("/Users/Sherlock/Desktop/Grad School/Fall 2018/Consulting/simdata.csv")
+
+# there is something super weird going on where 0.3 and 0.7 icc are not doubles even though the class is double
+dt.power[, icc := as.numeric(as.character(icc))]
+dt.power[, eff_size := as.numeric(as.character(eff_size))]
+
+tmp.plot.data <- subset(dt.power, icc %in% c(0.1, 0.3, 0.5, 0.7))
+tmp.plot.data <- subset(tmp.plot.data, eff_size %in% c(0.1, 0.3, 0.5, 0.7))
+
+ggplot(tmp.plot.data, aes(x = ss, y = p.exercise, group = eff_size, color = factor(eff_size))) +
+  geom_path( position = "identity", size = 2) +
+  facet_wrap(~icc, labeller = label_both) +
+  ylim(0,1) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "black") +
+  scale_y_continuous(labels = scales::percent, breaks = pretty(tmp.plot.data[,p.exercise], n = 10)) +
+  scale_color_brewer(type = "div", palette = "BrBG") +
+  guides(color=guide_legend(title="effect size of exercise")) +
+  labs(x = "Total sample size across 10 sites",
+       y = "study power",
+       title = "Power Analysis of Simulated Treatment Effect of Exercise on Swallowing Performance ",
+       subtitle = "Study Design: Randomize Control Trial") +
+  theme(text = element_text(size=15), legend.position = "top" ) +
+  annotate("text", x = 165, y = 0.85, label = "80% power")
+```
+
+
+### Results: Crossover Study Design
+
+The study design for a cross-over design looks like this :
+![study design diagram](Figs/study_diagram_cross.png)
+
+```{r power_func_cross, include=FALSE}
+# # create a function that runs a simulation and stores the power for each set of arguments
+# get_power_cross <- function(n_per_site, eff_size, icc, protein_eff = 0.05, iters = 100, n_sites = 10) {
+#   
+#   # compute the absolute effect based on the effect size passed into function
+#   # for both treatment arms
+#   eff_exercise <- round(eff_size*sdOutcome)
+#   eff_exercise_protein <- round((eff_size+protein_eff)*sdOutcome)
+#   
+#   f.control <-  paste(meanOutcome)
+#   f.exercise <- paste((meanOutcome + eff_exercise), "+ b")
+#   f.exercise_protein <- paste((meanOutcome + eff_exercise_protein), "+ b")
+#   
+#   # initialize a data table to store different variables
+#   power.results <- data.table(ss = n_per_site * n_sites, 
+#                               eff_size = eff_size,
+#                               icc = icc)
+#   
+#   p.results <- data.table()
+#   for (i in 1:iters) {
+#   
+#     indDef <- defData(varname = "b", formula = 0, variance = varWithin, 
+#                     dist = "normal")
+#   
+#     trtDef <- defCondition(condition = "treatment == 'control'", 
+#                          formula = f.control, 
+#                          variance = varWithin, dist = "normal")
+#     trtDef <- defCondition(trtDef, "treatment == 'exercise'",  
+#                          formula = f.exercise, 
+#                          variance = varWithin, dist = "normal")
+#     trtDef <- defCondition(trtDef, "treatment == 'exercise+'", 
+#                          formula = f.exercise_protein, 
+#                          variance = varWithin, dist = "normal")
+#   
+#     dt.persons <- genData(n_per_site, indDef)
+#     dt.persons.assign <- trtAssign(dt.persons, 3, grpName = "group")
+#     dt.persons.assign <- addPeriods(dt.persons.assign, 3)
+#   
+#     dt.persons.assign[group == 1, treatment := c("control", "exercise", "exercise+")]
+#     dt.persons.assign[group == 2, treatment := c("exercise+", "control", "exercise")]
+#     dt.persons.assign[group == 3, treatment := c("exercise", "exercise+", "control")]
+#   
+#     dt.persons.assign[, treatment := factor(treatment, levels = c("control", "exercise", "exercise+"))]
+#     # dt.persons.assign[, day := factor(period + 1)]
+#   
+#     dt.persons.assign <- addCondition(trtDef, dt.persons.assign, newvar = "Y")
+#   
+#     # store model fit
+#     mod.fit <- lmerTest::lmer(Y ~ treatment  + (1|id), data = dt.persons.assign)
+#   
+#     # extract p-values for each intervention
+#     p.exercise <- coef(summary(mod.fit))["treatmentexercise","Pr(>|t|)"]
+#     p.exercise_protein <- coef(summary(mod.fit))["treatmentexercise+","Pr(>|t|)"]
+#   
+#     # store p-values into a data.table
+#     p.results <- rbind(p.results, data.table(p.exercise, p.exercise_protein))
+#   }
+#   power.results <- cbind(power.results, p.results[, lapply(.SD, function(x) {mean(x < 0.05)})])
+#   return(power.results)
+# }
+```
+
+```{r power_by_params_cross, include=FALSE}
+# iters <- 100
+# # allocate all logical cores of machine except one to do the job
+# # using parallel package to running mapply with parallezation
+# n.cores <- detectCores() - 1
+# 
+# print("...Running power analysis for cross-over design with different sample sizes, effect sizes, and ICCs...")
+# tic(msg = "run power analysis",log = T)
+# power_run_cross <- mcmapply(get_power_cross, 
+#                             n_per_site = param.cols$n_per_site, 
+#                             eff_size = param.cols$eff_size, 
+#                             param.cols$icc, 
+#                             iters = iters, 
+#                             n_sites = n_sites, 
+#                             mc.cores = n.cores)
+# toc()
+```
+Now convert results from power analyis into a datatable
+```{r shape_power_results_cross, include=FALSE}
+# tic(msg = "convert to data.table", log = T)
+# print("...Finished power analysis. Now reshaping and converting to data.table...")
+# dt.power.cross <- data.table(t(power_run_cross))
+# dt.power.cross[, names(dt.power.cross) := lapply(.SD, as.numeric)]
+# setkey(dt.power.cross, ss, eff_size)
+# print("...Finished cleaning and reshaping results.")
+# toc()
+```
+
+
+```{r write_data_cross, include=FALSE}
+# save data.table to file and read in for later analysis
+# fwrite(dt.power.cross, "simdata_cross.csv")
+```
+
+A similiar plot of power but for a cross-over study design
+
+```{r plot_cross_poower}
+dt.power.cross <- fread("/Users/Sherlock/Desktop/Grad School/Fall 2018/Consulting/simdata_cross.csv")
+
+# there is something super weird going on where 0.3 and 0.7 icc are not doubles even though the class is double
+dt.power.cross[, icc := as.numeric(as.character(icc))]
+dt.power.cross[, eff_size := as.numeric(as.character(eff_size))]
+
+tmp.cross.dt <- subset(dt.power.cross, icc %in% c(0.1, 0.3, 0.5, 0.7))
+tmp.cross.dt <- subset(tmp.cross.dt, eff_size %in% c(0.1, 0.3, 0.5, 0.7))
+
+ggplot(tmp.cross.dt, aes(x = ss, y = p.exercise, group = eff_size, color = factor(eff_size))) +
+  geom_path( position = "identity", size = 2) +
+  facet_wrap(~icc, labeller = label_both) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "black") +
+  scale_y_continuous(labels = scales::percent, breaks = pretty(tmp.cross.dt[,p.exercise], n = 5),limits = c(0,1)) +
+  scale_color_brewer(type = "div", palette = "BrBG") +
+  guides(color=guide_legend(title="effect size of exercise")) +
+  labs(x = "Total sample size across 10 sites",
+       y = "study power",
+       title = "Power Analysis of Simulated Treatment Effect of Exercise on Swallowing Performance ",
+       subtitle = "Study Design: Cross-Over") +
+  theme(text = element_text(size=15), legend.position = "top" ) +
+  annotate("text", x = 165, y = 0.85, label = "80% power")
+
+```
